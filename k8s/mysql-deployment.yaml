@@ -41,10 +41,15 @@ spec:
         volumeMounts:
         - name: mysql-persistent-storage
           mountPath: /var/lib/mysql
+        - name: initdb-sql
+          mountPath: /docker-entrypoint-initdb.d
       volumes:
       - name: mysql-persistent-storage
         persistentVolumeClaim:
           claimName: mysql-pvc
+      - name: initdb-sql
+        configMap:
+          name: mysql-initdb
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -56,3 +61,27 @@ spec:
   resources:
     requests:
       storage: 1Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-initdb
+data:
+  init_db.sql: |
+CREATE TABLE IF NOT EXISTS user_portfolios (
+    user_id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(255) NOT NULL,
+    portfolio TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS stock_data (
+    symbol VARCHAR(10) NOT NULL,
+    date DATE NOT NULL,
+    open_price FLOAT,
+    high_price FLOAT,
+    low_price FLOAT,
+    close_price FLOAT,
+    volume INT,
+    PRIMARY KEY (symbol, date)
+);
+

@@ -1,0 +1,14 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: update-stocks
+spec:
+  schedule: "0 0 * * *"  # Every 24 hours
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: update-stocks
+            image: <your-dockerhub-username>/update-stocks:latest
+          restartPolicy: OnFailure

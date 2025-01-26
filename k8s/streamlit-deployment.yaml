@@ -12,9 +12,10 @@ spec:
       labels:
         app: streamlit-app
     spec:
+      dnsPolicy: ClusterFirst
       containers:
       - name: streamlit-app
-        image: <your-dockerhub-username>/streamlit-app:latest
+        image: hichwan/streamlit-app:latest
         ports:
         - containerPort: 8501
         env:
