@@ -1,10 +1,17 @@
 from alpha_vantage.timeseries import TimeSeries
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+import tensorflow as tf
 import pandas as pd
 import matplotlib.pyplot as plt
 import time
 import streamlit as st
 from sqlalchemy import create_engine, text
 import os
+
+LSTM = tf.keras.layers.LSTM
+Dense = tf.keras.layers.Dense
+Sequential = tf.keras.Sequential
 
 # MySQL Connection Details (Environment Variables for Docker/Kubernetes)
 MYSQL_USER = os.getenv("MYSQL_USER", "root")
@@ -40,6 +47,70 @@ def connect_to_db():
         print(f"Database connection failed: {e}")
         raise
 
+def prepare_lstm_data(data, look_back=60):
+    """
+    Prepares data for LSTM training.
+    Args:
+        data (array-like): Array of stock prices.
+        look_back (int): Number of past days to consider for predicting the next day's price.
+    Returns:
+        Tuple of (X, y) datasets for LSTM.
+    """
+    X, y = [], []
+    for i in range(len(data) - look_back):
+        X.append(data[i:i + look_back])
+        y.append(data[i + look_back])
+    return np.array(X), np.array(y)
+
+def build_lstm_model(input_shape):
+    """
+    Builds an LSTM model for stock price prediction.
+    Args:
+        input_shape (tuple): Shape of the input data (timesteps, features).
+    Returns:
+        LSTM model.
+    """
+    model = Sequential()
+    model.add(LSTM(units=50, return_sequences=True, input_shape=input_shape))
+    model.add(LSTM(units=50, return_sequences=False))
+    model.add(Dense(units=25))
+    model.add(Dense(units=1))
+    model.compile(optimizer='adam', loss='mean_squared_error')
+    return model
+
+def predict_stock_prices(data, look_back=60):
+    """
+    Trains an LSTM model and predicts future stock prices.
+    Args:
+        data (DataFrame): Stock price data with a "Close" column.
+        look_back (int): Number of past days to consider for predicting the next day's price.
+    Returns:
+        DataFrame with actual vs. predicted prices.
+    """
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_data = scaler.fit_transform(data["Close"].values.reshape(-1, 1))
+
+    # Prepare training data
+    train_data = scaled_data[:int(len(data) * 0.8)]
+    test_data = scaled_data[int(len(data) * 0.8) - look_back:]
+    X_train, y_train = prepare_lstm_data(train_data, look_back)
+    X_test, y_test = prepare_lstm_data(test_data, look_back)
+
+    # Build and train the LSTM model
+    model = build_lstm_model((X_train.shape[1], X_train.shape[2]))
+    model.fit(X_train, y_train, batch_size=1, epochs=10)
+
+    # Predict and scale back
+    predictions = model.predict(X_test)
+    predictions = scaler.inverse_transform(predictions)
+    y_test = scaler.inverse_transform(y_test.reshape(-1, 1))
+
+    # Combine actual vs. predicted prices
+    predicted_df = pd.DataFrame({
+        "Actual": y_test.flatten(),
+        "Predicted": predictions.flatten()
+    })
+    return predicted_df
 
 def calculate_rsi(data, window=14):
     delta = data["Close"].diff(1)
@@ -61,27 +132,36 @@ def calculate_macd(data, fast_period=12, slow_period=26, signal_period=9):
 
 def calculate_true_sharpe_ratio(data, risk_free_rate, time_frame_years):
     """
-    Calculate the true Sharpe Ratio for the selected time frame.
+    Calculate the true Sharpe Ratio using cumulative returns over the selected time frame.
     Args:
-        data (DataFrame): Data with 'Daily_Return'.
+        data (DataFrame): Data with 'Close' prices and 'Daily_Return'.
         risk_free_rate (float): Annualized risk-free rate.
         time_frame_years (float): Time frame in years.
     Returns:
         float: Sharpe Ratio for the selected period.
     """
-    # Filter data for the selected time frame
-    period_returns = data["Daily_Return"].dropna()
-    
-    # Calculate the mean and standard deviation of returns for the period
-    avg_return_period = period_returns.mean() * (252 * time_frame_years)  # Scale to time frame
-    std_dev_period = period_returns.std() * (252**0.5)  # Annualized volatility
+    # Ensure valid data
+    if data.empty or "Close" not in data.columns:
+        return 0
 
-    # Adjust the risk-free rate to the selected time frame
-    adjusted_risk_free_rate = risk_free_rate * time_frame_years
+    # Calculate cumulative return over the period
+    start_price = data["Close"].iloc[0]
+    end_price = data["Close"].iloc[-1]
+    cumulative_return = (end_price / start_price - 1)
+
+    # Annualize cumulative return
+    annualized_return = cumulative_return / time_frame_years
+
+    # Annualize standard deviation of daily returns
+    std_dev_annualized = data["Daily_Return"].std() * (252**0.5)  # Annualized volatility
+
+    # Adjust risk-free rate to annualized basis
+    adjusted_risk_free_rate = risk_free_rate
 
     # Calculate Sharpe Ratio
-    sharpe_ratio = (avg_return_period - adjusted_risk_free_rate) / std_dev_period if std_dev_period != 0 else 0
+    sharpe_ratio = (annualized_return - adjusted_risk_free_rate) / std_dev_annualized if std_dev_annualized != 0 else 0
     return sharpe_ratio
+
 
 
 def classify_stock(volatility, sharpe_ratio_daily, sharpe_ratio_cumulative, risk_tolerance):
@@ -276,10 +356,18 @@ time_frame = st.sidebar.slider(
 
 stock_dict = {}
 
+# Initialize stock_dict in session_state if it doesn't exist
+if "stock_dict" not in st.session_state:
+    st.session_state.stock_dict = {}
+
 if st.sidebar.button("Fetch Data"): 
     portfolio_summary_metrics = []  # For numerical data
     portfolio_summary_recommendations = []  # For classifications
     with st.spinner("Fetching stock data..."):
+        # Initialize or update session state
+        if "stock_dict" not in st.session_state:
+            st.session_state.stock_dict = {}
+
         for symbol in symbols:
             try:
                 # Load or fetch data
@@ -338,7 +426,8 @@ if st.sidebar.button("Fetch Data"):
                         "Long-Term Recommendation": classification.get("Long-Term"),
                     })
 
-                    stock_dict[symbol] = data_filtered
+                    # Update session state with the symbol's data
+                    st.session_state.stock_dict[symbol] = data_filtered  # Add or update entry for symbol
                 else:
                     st.warning(f"Insufficient data for {symbol} to calculate RSI or MACD.")
 
@@ -346,6 +435,9 @@ if st.sidebar.button("Fetch Data"):
 
             except Exception as e:
                 st.error(f"Error fetching data for {symbol}: {e}")
+
+    # Debug: Show the keys in stock_dict to confirm multiple symbols are present
+    st.write("Symbols in stock_dict:", list(st.session_state.stock_dict.keys()))
 
     # Display results
     if portfolio_summary_metrics:
@@ -358,97 +450,120 @@ if st.sidebar.button("Fetch Data"):
         portfolio_recommendations_df = pd.DataFrame(portfolio_summary_recommendations)
         st.dataframe(portfolio_recommendations_df)
 
+# Add a checkbox in the sidebar for enabling LSTM predictions
+enable_lstm = st.sidebar.checkbox("Enable LSTM Predictions", value=False)
 
-if stock_dict:
-    for symbol, data in stock_dict.items():
+# Render Charts for Each Stock
+if "stock_dict" in st.session_state and st.session_state.stock_dict:
+    for symbol, data in st.session_state.stock_dict.items():
         st.subheader(f"{symbol} Stock Price Analysis")
 
-        # Debugging: Display the dataset
-        st.write(f"Data for {symbol}:")
-        st.write(data.head())
-
-        # Ensure the date column is set as the index
-        if "date" in data.columns:
-            data["date"] = pd.to_datetime(data["date"], errors="coerce")  # Convert to datetime
-            data = data.dropna(subset=["date"])  # Drop rows with invalid dates
-            data.set_index("date", inplace=True)  # Set date as index
-
-        # Check required columns
-        required_columns = ["Close", "20_MA", "50_MA", "Upper_Band", "Lower_Band", "RSI", "MACD_Line", "Signal_Line"]
-        missing_columns = [col for col in required_columns if col not in data.columns]
-        if missing_columns:
-            st.error(f"Missing required columns for {symbol}: {missing_columns}")
-            continue
-
-        # Bollinger Bands and Closing Price
-        with st.expander(f"About Bollinger Bands and Closing Price for {symbol}"):
-            st.markdown(
-                """
-                - **Bollinger Bands**: Used to measure market volatility and identify overbought or oversold conditions.
-                - The **Upper Band** represents a resistance level, while the **Lower Band** represents a support level.
-                - **Closing Price**: The price at which the stock closed for the day.
-                """
-            )
-
-        # Calculate both short-term and long-term Sharpe Ratios
-        sharpe_ratio_daily = (data["Daily_Return"].mean() - risk_free_rate) / data["Daily_Return"].std() if data["Daily_Return"].std() != 0 else 0
-        sharpe_ratio_cumulative = calculate_true_sharpe_ratio(data, risk_free_rate, time_frame)
-
-        # Plot Bollinger Bands and Closing Price
+        # Bollinger Bands
+        st.subheader(f"{symbol} Bollinger Bands")
+        st.markdown(
+            """
+            **Bollinger Bands**:
+            - Used to measure market volatility and identify overbought or oversold conditions.
+            - The **Upper Band** represents a resistance level, while the **Lower Band** represents a support level.
+            - **Closing Price**: The price at which the stock closed for the day.
+            """
+        )
         fig, ax = plt.subplots(figsize=(14, 7))
         ax.plot(data.index, data["Close"], label="Closing Price", alpha=0.75)
         ax.plot(data.index, data["20_MA"], label="20-Day Moving Average", alpha=0.75)
-        ax.plot(data.index, data["50_MA"], label="50-Day Moving Average", alpha=0.75)
         ax.fill_between(data.index, data["Lower_Band"], data["Upper_Band"], alpha=0.2, label="Bollinger Bands")
-
-        # Add Sharpe Ratios to the title
-        ax.set_title(f"{symbol} Stock Price with Bollinger Bands\n"
-                    f"Sharpe Ratio (Daily): {sharpe_ratio_daily:.2f} | Sharpe Ratio (Cumulative): {sharpe_ratio_cumulative:.2f}")
+        ax.set_title(f"{symbol} Stock Price with Bollinger Bands")
         ax.set_xlabel("Date")
         ax.set_ylabel("Price (USD)")
         ax.legend()
         st.pyplot(fig)
 
-
         # RSI
-        with st.expander(f"About RSI for {symbol}"):
-            st.markdown(
-                """
-                - **Relative Strength Index (RSI)**: Measures the strength and momentum of price movements.
-                - Values above 70 indicate overbought conditions, suggesting a potential price decline.
-                - Values below 30 indicate oversold conditions, suggesting a potential price increase.
-                """
-            )
-
-        # Plot RSI
         st.subheader(f"{symbol} RSI")
+        st.markdown(
+            """
+            **Relative Strength Index (RSI)**:
+            - Measures the strength and momentum of price movements.
+            - Values above 70 indicate overbought conditions, suggesting a potential price decline.
+            - Values below 30 indicate oversold conditions, suggesting a potential price increase.
+            """
+        )
         fig, ax = plt.subplots(figsize=(14, 4))
-        ax.plot(data.index, data['RSI'], label='RSI', color='blue')
-        ax.axhline(70, color='red', linestyle='--', label='Overbought (70)')
-        ax.axhline(30, color='green', linestyle='--', label='Oversold (30)')
+        ax.plot(data.index, data["RSI"], label="RSI", color="blue")
+        ax.axhline(70, color="red", linestyle="--", label="Overbought (70)")
+        ax.axhline(30, color="green", linestyle="--", label="Oversold (30)")
         ax.set_title(f"{symbol} RSI")
         ax.set_xlabel("Date")
         ax.legend()
         st.pyplot(fig)
 
         # MACD
-        with st.expander(f"About MACD for {symbol}"):
-            st.markdown(
-                """
-                - **MACD (Moving Average Convergence Divergence)**: Indicates trends and momentum.
-                - The **MACD Line** is calculated as the difference between the fast and slow exponential moving averages (EMAs).
-                - The **Signal Line** is the EMA of the MACD Line and helps identify buy/sell signals.
-                - Positive values above 0 suggest upward momentum, while negative values below 0 suggest downward momentum.
-                """
-            )
-
-        # Plot MACD
         st.subheader(f"{symbol} MACD")
+        st.markdown(
+            """
+            **Moving Average Convergence Divergence (MACD)**:
+            - Indicates trends and momentum.
+            - The **MACD Line** is calculated as the difference between the fast and slow exponential moving averages (EMAs).
+            - The **Signal Line** is the EMA of the MACD Line and helps identify buy/sell signals.
+            - Positive values above 0 suggest upward momentum, while negative values below 0 suggest downward momentum.
+            """
+        )
         fig, ax = plt.subplots(figsize=(14, 4))
-        ax.plot(data.index, data['MACD_Line'], label='MACD Line', color='blue')
-        ax.plot(data.index, data['Signal_Line'], label='Signal Line', color='red')
-        ax.axhline(0, color='black', linestyle='--', label='Zero Line')
+        ax.plot(data.index, data["MACD_Line"], label="MACD Line", color="blue")
+        ax.plot(data.index, data["Signal_Line"], label="Signal Line", color="red")
+        ax.axhline(0, color="black", linestyle="--", label="Zero Line")
         ax.set_title(f"{symbol} MACD")
         ax.set_xlabel("Date")
         ax.legend()
         st.pyplot(fig)
+
+        # LSTM Predictions (if enabled)
+        if enable_lstm:
+            st.subheader(f"LSTM Prediction for {symbol}")
+            st.markdown(
+                """
+                **LSTM-Based Stock Price Prediction**:
+                - Trains a Long Short-Term Memory (LSTM) neural network to predict future stock prices.
+                - The model uses historical data and considers price trends to forecast future movements.
+                """
+            )
+            look_back = st.sidebar.slider(
+                f"{symbol} Look-Back Period",
+                min_value=30,
+                max_value=120,
+                value=60,
+                step=10,
+                key=f"{symbol}_look_back"
+            )
+
+            if len(data) < look_back + 1:
+                st.warning(f"Insufficient data for {symbol} to generate LSTM predictions. Try reducing the look-back period.")
+                continue
+
+            with st.spinner(f"Processing LSTM predictions for {symbol}..."):
+                try:
+                    predicted_df = predict_stock_prices(data, look_back=look_back)
+
+                    # Plot LSTM predictions
+                    fig, ax = plt.subplots(figsize=(14, 7))
+                    ax.plot(predicted_df.index, predicted_df["Actual"], label="Actual Prices", color="blue")
+                    ax.plot(predicted_df.index, predicted_df["Predicted"], label="Predicted Prices", color="orange")
+                    ax.set_title(f"{symbol} - Actual vs. Predicted Prices")
+                    ax.set_xlabel("Time")
+                    ax.set_ylabel("Price")
+                    ax.legend()
+                    st.pyplot(fig)
+
+                    # Buy/Sell Recommendations
+                    last_actual_price = predicted_df["Actual"].iloc[-1]
+                    next_predicted_price = predicted_df["Predicted"].iloc[-1]
+                    if next_predicted_price > last_actual_price:
+                        st.markdown(f"**Recommendation for {symbol}:** 🟢 **Buy** - Predicted price (${next_predicted_price:.2f}) is higher than the current price (${last_actual_price:.2f}).")
+                    else:
+                        st.markdown(f"**Recommendation for {symbol}:** 🔴 **Sell** - Predicted price (${next_predicted_price:.2f}) is lower than the current price (${last_actual_price:.2f}).")
+                except Exception as e:
+                    st.error(f"Error during LSTM prediction for {symbol}: {e}")
+
+
+        # Divider between symbols
+        st.markdown("---")
